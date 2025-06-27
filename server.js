@@ -17,23 +17,30 @@ const MAX_FILE_MB  = 100;
 if (!fs.existsSync(DATA_DIR))     fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PASSPORT_DIR)) fs.mkdirSync(PASSPORT_DIR, { recursive: true });
 
-// ───── Multer ─────
+/** Build a safe filename:
+ *  1.  keep Hebrew / UTF-8
+ *  2.  replace spaces → _
+ *  3.  strip Windows-forbidden chars  \ / : * ? " < > |
+ */
+function safeName(raw) {
+  return raw
+    .replace(/[\s]+/g, "_")
+    .replace(/[\\/:*?"<>|]+/g, "")
+    .trim();
+}
+
+// ───── Multer: save exactly as received, after sanitising ─────
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, PASSPORT_DIR),
-  filename   : (_, file, cb) => cb(null,
-      file.originalname        // React כבר מספק “first_middle_last_#idx.ext”
-        .replace(/\s+/g, "_")
-        .replace(/[^a-zA-Z0-9_.-]/g, "")
-        .toLowerCase())
+  filename   : (_, file, cb) => cb(null, safeName(file.originalname))
 });
 const upload = multer({
   storage,
   limits: { fileSize: MAX_FILE_MB * 1024 * 1024 },
-  fileFilter: (_, f, cb) =>
-    cb(null, /^image\//.test(f.mimetype))
+  fileFilter: (_, f, cb) => cb(null, /^image\//.test(f.mimetype))
 });
 
-// ───── Workbook helper ─────
+// ───── Workbook helpers ─────
 function loadWorkbook() {
   if (fs.existsSync(EXCEL_PATH)) {
     const wb = XLSX.readFile(EXCEL_PATH);
@@ -45,10 +52,26 @@ function loadWorkbook() {
   return { wb, ws };
 }
 
-// ───── POST  /submit-rsvp ─────
-app = express();
+// write with retry – fixes “file in use” on mobile browsers
+function writeWorkbookWithRetry(wb, attempt = 1) {
+  try {
+    const tmp = EXCEL_PATH + ".tmp";
+    XLSX.writeFile(wb, tmp);
+    fs.renameSync(tmp, EXCEL_PATH);
+  } catch (err) {
+    if (err.code === "EBUSY" && attempt < 6) {
+      console.warn(`Excel busy – retry ${attempt}/5`);
+      return setTimeout(() => writeWorkbookWithRetry(wb, attempt + 1), 500);
+    }
+    throw err;
+  }
+}
+
+// ───── Express app ─────
+const app = express();
 app.use(cors({ origin: true }));
 
+// ───── POST /submit-rsvp ─────
 app.post("/submit-rsvp", upload.array("passports"), (req, res) => {
   try {
     const mainEmail = (req.body.mainEmail || "").trim();
@@ -56,22 +79,22 @@ app.post("/submit-rsvp", upload.array("passports"), (req, res) => {
     if (!mainEmail || !guests.length)
       return res.status(400).json({ ok:false, error:"bad_request" });
 
-    /* 1. build set of uploaded file-names (ללא סיומת) */
+    // 1. Build set of uploaded filenames (without extension)
     const passportSet = new Set(
-      req.files.map(f => path.parse(f.filename).name)
+      req.files.map(f => path.parse(f.filename).name.toLowerCase())
     );
 
-    /* 2. open / create workbook */
+    // 2. Open / create workbook
     const { wb, ws } = loadWorkbook();
     const before     = XLSX.utils.sheet_to_json(ws);
 
-    /* 3. build new rows */
+    // 3. Build new rows
     const newRows = guests.map((g, idx) => {
       const norm = [
         g.firstName, g.middleName, g.lastName, idx + 1
       ].filter(Boolean).join("_")
         .replace(/\s+/g, "_")
-        .replace(/[^a-zA-Z0-9_]/g, "")
+        .replace(/[^a-zA-Z0-9_\u0590-\u05FF]/g, "") // keep Hebrew letters too
         .toLowerCase();
 
       return {
@@ -86,15 +109,15 @@ app.post("/submit-rsvp", upload.array("passports"), (req, res) => {
         attendance    : g.attendance,
         allergies     : (g.allergies || []).join(", "),
         other_allergy : g.otherAllergy,
-        passport      : g.passport
+        passport      : passportSet.has(norm) ? "yes" : g.passport
       };
     });
 
-    /* 4. save */
+    // 4. Save workbook (with retry)
     wb.Sheets[wb.SheetNames[0]] =
       XLSX.utils.json_to_sheet(before.concat(newRows));
+    writeWorkbookWithRetry(wb);
 
-    XLSX.writeFile(wb, EXCEL_PATH);
     res.json({ ok:true, guests:newRows.length, images:req.files.length });
   } catch (err) {
     console.error(err);
